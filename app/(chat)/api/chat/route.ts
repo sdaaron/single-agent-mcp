@@ -1,9 +1,11 @@
 import {
+  StreamTextResult,
   UIMessage,
   appendResponseMessages,
   createDataStreamResponse,
   smoothStream,
   streamText,
+  DataStreamWriter,
 } from 'ai';
 import { auth } from '@/app/(auth)/auth';
 import { systemPrompt } from '@/lib/ai/prompts';
@@ -25,6 +27,8 @@ import { requestSuggestions } from '@/lib/ai/tools/request-suggestions';
 import { getWeather } from '@/lib/ai/tools/get-weather';
 import { isProductionEnvironment } from '@/lib/constants';
 import { myProvider } from '@/lib/ai/providers';
+import { chatModels } from '@/lib/ai/models';
+import { CoreMessage } from 'ai';
 
 export const maxDuration = 60;
 
@@ -33,7 +37,7 @@ export async function POST(request: Request) {
     const {
       id,
       messages,
-      selectedChatModel,
+      selectedChatModel: selectedChatModelId,
     }: {
       id: string;
       messages: Array<UIMessage>;
@@ -57,7 +61,6 @@ export async function POST(request: Request) {
     if (!chat) {
       const title = await generateTitleFromUserMessage({
         message: userMessage,
-        selectedChatModel,
       });
 
       await saveChat({ id, userId: session.user.id, title });
@@ -80,51 +83,67 @@ export async function POST(request: Request) {
       ],
     });
 
+    const selectedModelInfo = chatModels.find(m => m.id === selectedChatModelId);
+
+    if (!selectedModelInfo) {
+      console.error(`Model with ID ${selectedChatModelId} not found in models.ts`);
+      return new Response('Invalid model selected', { status: 400 });
+    }
+
+    const modelIdForProvider = selectedChatModelId.endsWith('-thinking')
+                             ? selectedChatModelId.replace('-thinking', '')
+                             : selectedChatModelId;
+
     return createDataStreamResponse({
-      execute: async (dataStream) => {
+      execute: async (dataStream: DataStreamWriter) => {
         try {
-          const result = streamText({
-            model: myProvider.languageModel(selectedChatModel),
-            system: systemPrompt({ selectedChatModel }),
+          const tools = {
+            getWeather,
+            createDocument: createDocument({ session, dataStream }),
+            updateDocument: updateDocument({ session, dataStream }),
+            requestSuggestions: requestSuggestions({
+              session,
+              dataStream,
+            }),
+          };
+
+          const streamTextOptions: any = {
+            model: myProvider.languageModel(modelIdForProvider),
+            system: systemPrompt({ selectedChatModel: selectedChatModelId }),
             messages,
             maxSteps: 5,
-            experimental_activeTools:
-              selectedChatModel === 'chat-model-reasoning'
-                ? []
-                : [
-                    'getWeather',
-                    'createDocument',
-                    'updateDocument',
-                    'requestSuggestions',
-                  ],
             experimental_transform: smoothStream({ chunking: 'word' }),
             experimental_generateMessageId: generateUUID,
-            tools: {
-              getWeather,
-              createDocument: createDocument({ session, dataStream }),
-              updateDocument: updateDocument({ session, dataStream }),
-              requestSuggestions: requestSuggestions({
-                session,
-                dataStream,
-              }),
-            },
-            onFinish: async ({ response }) => {
+            tools: tools,
+            onFinish: async ({ response }: { response: any }) => {
+              console.log("--- streamText raw onFinish data (middleware disabled for Gemini) ---");
+              console.log("Final Response Messages Structure:", JSON.stringify(response?.messages, null, 2));
+              console.log("--- End streamText raw onFinish data ---");
+              
               if (session.user?.id) {
                 try {
-                  const assistantId = getTrailingMessageId({
-                    messages: response.messages.filter(
-                      (message) => message.role === 'assistant',
-                    ),
-                  });
+                  const assistantMessages = response?.messages?.filter(
+                    (message: CoreMessage) => message.role === 'assistant'
+                  ) ?? [];
+                  
+                  const assistantId = getTrailingMessageId({ messages: assistantMessages });
 
                   if (!assistantId) {
-                    throw new Error('No assistant message found!');
+                    console.error('No assistant message found in final response!');
+                    return; 
                   }
 
-                  const [, assistantMessage] = appendResponseMessages({
+                  const finalMessages = appendResponseMessages({
                     messages: [userMessage],
-                    responseMessages: response.messages,
+                    responseMessages: response?.messages ?? [],
                   });
+                  
+                  const assistantMessage = finalMessages.find(m => m.id === assistantId);
+
+                  if (!assistantMessage) {
+                    console.error('Assistant message with ID not found after appendResponseMessages!');
+                    return;
+                  }
 
                   await saveMessages({
                     messages: [
@@ -139,8 +158,8 @@ export async function POST(request: Request) {
                       },
                     ],
                   });
-                } catch (_) {
-                  console.error('Failed to save chat after stream finish');
+                } catch (saveError) {
+                  console.error('Failed to save chat after stream finish:', saveError);
                 }
               }
             },
@@ -148,13 +167,37 @@ export async function POST(request: Request) {
               isEnabled: isProductionEnvironment,
               functionId: 'stream-text',
             },
-          });
+          };
 
-          result.consumeStream();
+          if (selectedChatModelId === 'claude-3-7-sonnet-20250219-thinking') {
+            streamTextOptions.providerOptions = {
+              anthropic: {
+                thinking: { type: 'enabled', budgetTokens: 12000 },
+              },
+            };
+          } else if (selectedModelInfo.isReasoningEnabled) {
+            streamTextOptions.experimental_activeTools = Object.keys(tools);
+          } else {
+            streamTextOptions.experimental_activeTools = [];
+          }
 
+          const result = streamText(streamTextOptions);
+
+          // Remove the raw stream logging loop to fix linter error and simplify
+          // --- Start: Log raw stream parts --- 
+          // const [logStream, mainStream] = result.fullStream.tee(); 
+          // console.log("--- Logging raw stream parts from Gemini (middleware disabled) ---");
+          // (async () => { ... logging logic ... })();
+          // --- End: Log raw stream parts --- 
+          
+          // Consume the stream using the original result object's logic
+          result.consumeStream(); 
+
+          // Merge the result into the data stream
           result.mergeIntoDataStream(dataStream, {
-            sendReasoning: true,
+            sendReasoning: true, 
           });
+
         } catch (error) {
           console.error("Error during streamText execution:", error);
         }
